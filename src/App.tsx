@@ -92,6 +92,7 @@ export default function App() {
   const [adminSubmissions, setAdminSubmissions] = useState<Submission[]>([]);
   const [refreshingAdmin, setRefreshingAdmin] = useState(false);
 
+  const [storageMode, setStorageMode] = useState<'local' | 'supabase'>('local');
   const [toast, setToast] = useState<ToastState | null>(null);
 
   const notify = useCallback((kind: 'success' | 'error', message: string) => {
@@ -100,6 +101,15 @@ export default function App() {
     setTimeout(() => {
       setToast((prev) => (prev?.id === id ? null : prev));
     }, 4500);
+  }, []);
+
+  useEffect(() => {
+    fetch('/api/config')
+      .then((res) => (res.ok ? (res.json() as Promise<{ storageMode?: 'local' | 'supabase' }>) : null))
+      .then((data) => {
+        if (data?.storageMode) setStorageMode(data.storageMode);
+      })
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -525,14 +535,71 @@ export default function App() {
 
   // ---------------- FILE DOWNLOADS & SUBMISSIONS ----------------
 
-  const triggerBlobDownload = async (url: string, filename: string, token?: string | null) => {
-    const res = await fetch(url, {
-      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+  const computeFileSha256 = async (file: File): Promise<string> => {
+    try {
+      const buffer = await file.arrayBuffer();
+      const digest = await crypto.subtle.digest('SHA-256', buffer);
+      return Array.from(new Uint8Array(digest))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    } catch {
+      return 'client-hash-unavailable';
+    }
+  };
+
+  const uploadFileToSupabase = async (
+    file: File,
+    signedUrl: string,
+    storagePath: string
+  ) => {
+    const putRes = await fetch(signedUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Type': file.type || 'application/octet-stream',
+        'x-upsert': 'true',
+      },
+      body: file,
     });
+    if (!putRes.ok) {
+      throw new Error(`Storage upload failed for ${file.name}`);
+    }
+    const sha256 = await computeFileSha256(file);
+    const dotIdx = file.name.lastIndexOf('.');
+    const ext = dotIdx !== -1 ? file.name.slice(dotIdx).toLowerCase() : '.bin';
+    return {
+      originalName: file.name,
+      storedName: storagePath,
+      extension: ext,
+      mimeType: file.type || 'application/octet-stream',
+      sizeBytes: file.size,
+      sha256,
+    };
+  };
+
+  const triggerBlobDownload = async (url: string, filename: string, token?: string | null) => {
+    const headers: Record<string, string> = { Accept: 'application/json' };
+    if (token) headers.Authorization = `Bearer ${token}`;
+
+    const res = await fetch(url, { headers });
     if (!res.ok) {
       const errData = (await res.json().catch(() => ({}))) as { error?: string };
       throw new Error(errData.error ?? 'Download failed');
     }
+
+    const contentType = res.headers.get('content-type') ?? '';
+    if (contentType.includes('application/json')) {
+      const data = (await res.json()) as { url?: string; fileName?: string };
+      if (!data.url) throw new Error('Missing signed download URL');
+      const link = document.createElement('a');
+      link.href = data.url;
+      link.download = data.fileName ?? filename;
+      link.rel = 'noopener noreferrer';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      return;
+    }
+
     const blob = await res.blob();
     const objectUrl = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -569,11 +636,56 @@ export default function App() {
   const handleSubmitReport = async (formData: FormData): Promise<boolean> => {
     if (!participantToken) return false;
     try {
-      const res = await fetch('/api/submissions', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${participantToken}` },
-        body: formData,
-      });
+      let res: Response;
+      if (storageMode === 'supabase') {
+        const file = formData.get('reportFile');
+        if (!(file instanceof File)) {
+          notify('error', 'Please attach an investigation report file.');
+          return false;
+        }
+        const signRes = await fetch('/api/submissions/sign-upload', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${participantToken}`,
+          },
+          body: JSON.stringify({ originalName: file.name }),
+        });
+        const signData = (await signRes.json()) as {
+          storagePath?: string;
+          signedUrl?: string;
+          error?: string;
+        };
+        if (!signRes.ok || !signData.signedUrl || !signData.storagePath) {
+          notify('error', signData.error ?? 'Failed to prepare report upload.');
+          return false;
+        }
+        const uploadedFile = await uploadFileToSupabase(
+          file,
+          signData.signedUrl,
+          signData.storagePath
+        );
+        res = await fetch('/api/submissions', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${participantToken}`,
+          },
+          body: JSON.stringify({
+            caseId: String(formData.get('caseId') ?? ''),
+            summary: String(formData.get('summary') ?? ''),
+            methodology: String(formData.get('methodology') ?? ''),
+            uploadedFile,
+          }),
+        });
+      } else {
+        res = await fetch('/api/submissions', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${participantToken}` },
+          body: formData,
+        });
+      }
+
       const data = (await res.json()) as { submission?: Submission; error?: string };
       if (!res.ok || !data.submission) {
         notify('error', data.error ?? 'Failed to upload investigation report.');
@@ -586,8 +698,11 @@ export default function App() {
         `Report "${data.submission.fileName}" submitted for ${data.submission.caseCode}.`
       );
       return true;
-    } catch {
-      notify('error', 'Upload failed. Check file size and network connection.');
+    } catch (err) {
+      notify(
+        'error',
+        err instanceof Error ? err.message : 'Upload failed. Check file size and network connection.'
+      );
       return false;
     }
   };
@@ -624,14 +739,68 @@ export default function App() {
     notify('success', 'Signed out from Admin Console.');
   };
 
+  const uploadAdminEvidenceFiles = async (files: File[]) => {
+    if (!adminToken || files.length === 0) return [];
+    const signRes = await fetch('/api/admin/storage/sign-uploads', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${adminToken}`,
+      },
+      body: JSON.stringify({
+        files: files.map((f) => ({ originalName: f.name })),
+      }),
+    });
+    const signData = (await signRes.json()) as {
+      uploads?: { originalName: string; storagePath: string; signedUrl: string }[];
+      error?: string;
+    };
+    if (!signRes.ok || !signData.uploads) {
+      throw new Error(signData.error ?? 'Failed to prepare file uploads.');
+    }
+    return Promise.all(
+      files.map((file, idx) =>
+        uploadFileToSupabase(
+          file,
+          signData.uploads![idx].signedUrl,
+          signData.uploads![idx].storagePath
+        )
+      )
+    );
+  };
+
   const handleCreateCase = async (formData: FormData): Promise<boolean> => {
     if (!adminToken) return false;
     try {
-      const res = await fetch('/api/admin/cases', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${adminToken}` },
-        body: formData,
-      });
+      let res: Response;
+      if (storageMode === 'supabase') {
+        const rawFiles = formData.getAll('files').filter((f): f is File => f instanceof File);
+        const uploadedFiles = await uploadAdminEvidenceFiles(rawFiles);
+        res = await fetch('/api/admin/cases', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${adminToken}`,
+          },
+          body: JSON.stringify({
+            code: String(formData.get('code') ?? ''),
+            title: String(formData.get('title') ?? ''),
+            category: String(formData.get('category') ?? ''),
+            difficulty: String(formData.get('difficulty') ?? ''),
+            status: String(formData.get('status') ?? ''),
+            briefing: String(formData.get('briefing') ?? ''),
+            objectives: String(formData.get('objectives') ?? ''),
+            uploadedFiles,
+          }),
+        });
+      } else {
+        res = await fetch('/api/admin/cases', {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${adminToken}` },
+          body: formData,
+        });
+      }
+
       const data = (await res.json()) as { caseStudy?: CaseStudy; error?: string };
       if (!res.ok || !data.caseStudy) {
         notify('error', data.error ?? 'Failed to create case study.');
@@ -640,8 +809,8 @@ export default function App() {
       notify('success', `Uploaded ${data.caseStudy.code}: ${data.caseStudy.title}.`);
       await fetchAdminData(adminToken);
       return true;
-    } catch {
-      notify('error', 'Error uploading case study files.');
+    } catch (err) {
+      notify('error', err instanceof Error ? err.message : 'Error uploading case study files.');
       return false;
     }
   };
@@ -649,11 +818,26 @@ export default function App() {
   const handleAttachFiles = async (caseId: string, formData: FormData): Promise<boolean> => {
     if (!adminToken) return false;
     try {
-      const res = await fetch(`/api/admin/cases/${caseId}/files`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${adminToken}` },
-        body: formData,
-      });
+      let res: Response;
+      if (storageMode === 'supabase') {
+        const rawFiles = formData.getAll('files').filter((f): f is File => f instanceof File);
+        const uploadedFiles = await uploadAdminEvidenceFiles(rawFiles);
+        res = await fetch(`/api/admin/cases/${caseId}/files`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${adminToken}`,
+          },
+          body: JSON.stringify({ uploadedFiles }),
+        });
+      } else {
+        res = await fetch(`/api/admin/cases/${caseId}/files`, {
+          method: 'POST',
+          headers: { Authorization: `Bearer ${adminToken}` },
+          body: formData,
+        });
+      }
+
       const data = (await res.json()) as { addedFiles?: EvidenceFile[]; error?: string };
       if (!res.ok) {
         notify('error', data.error ?? 'Could not attach files.');
@@ -665,8 +849,8 @@ export default function App() {
       );
       await fetchAdminData(adminToken);
       return true;
-    } catch {
-      notify('error', 'Error attaching evidence files.');
+    } catch (err) {
+      notify('error', err instanceof Error ? err.message : 'Error attaching evidence files.');
       return false;
     }
   };
