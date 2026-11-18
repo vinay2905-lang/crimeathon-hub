@@ -1,0 +1,6 @@
+{
+  "name": "Crimeathon Hub",
+  "description": "Cyber crime investigation hackathon platform by Sentrix Cyber Club at SIMATS Engineering for case study distribution, evidence downloads, report submissions, and judge evaluation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
